@@ -1,0 +1,78 @@
+#Get graph
+import json
+from networkx.readwrite import json_graph
+
+def read_graph_from_json(json_file):
+    with open(json_file) as f:
+        data = json.load(f)
+    return json_graph.adjacency_graph(data) 
+path = "C:/Users/kailu/OneDrive/Documents/1 OR Project/"
+name = 'KS_county.json'
+
+K = read_graph_from_json( path + name )
+
+#Calculate bounds on population
+for node in K.nodes:
+    K.nodes[node]['POP'] = K.nodes[node]['P0010001']
+
+import math
+dev = 0.01
+k = 4 
+total_population = sum( K.nodes[node]['POP'] for node in K.nodes )
+L = math.ceil( ( 1 - dev / 2 ) * total_pop / k )
+U = math.floor( ( 1 + dev / 2 ) * total_pop / k )
+print("Using L =",L,"and U =",U,"and k =",k)
+
+#Get gurobi
+#!pip install gurobipy
+import gurobipy as gp
+from gurobipy import GRB
+
+#Build model (vars, objective, then constraints)
+m = gp.Model()
+x = m.addVars(K.nodes, k, vtype=GRB.BINARY) 
+y = m.addVars(K.edges, vtype=GRB.BINARY)
+
+#   model objective
+m.setObjective( gp.quicksum( K.edges[u,v]['shared_perim'] * y[u,v] for u,v in K.edges ), GRB.MINIMIZE )
+
+#   model constraints
+m.addConstrs( gp.quicksum( x[i,j] for j in range(k)) == 1 for i in K.nodes )
+m.addConstrs( gp.quicksum( K.nodes[i]['POP'] * x[i,j] for i in K.nodes) >= L for j in range(k) )
+m.addConstrs( gp.quicksum( K.nodes[i]['POP'] * x[i,j] for i in K.nodes) <= U for j in range(k) )
+m.addConstrs( x[u,j] - x[v,j] <= y[u,v] for u,v in K.edges for j in range(k) )
+
+m.update()
+
+#Contiguity Constraints (Get directed network first)
+r = m.addVars( K.nodes, k, vtype=GRB.BINARY)
+import networkx as nx
+DK = nx.DiGraph(K)      # directed version of G
+
+f = m.addVars( DK.edges )
+M = K.number_of_nodes() - k + 1
+
+#    Contiguity constraints
+m.addConstrs( gp.quicksum( r[i,j] for i in K.nodes ) == 1 for j in range(k) )
+m.addConstrs( r[i,j] <= x[i,j] for i in K.nodes for j in range(k) ) 
+m.addConstrs( gp.quicksum( f[j,i] - f[i,j] for j in K.neighbors(i) ) 
+             >= 1 - M * gp.quicksum( r[i,j] for j in range(k) ) for i in K.nodes )
+m.addConstrs( f[i,j] + f[j,i] <= M * ( 1 - y[i,j] ) for i,j in K.edges )
+
+m.update()
+
+#Solve the model
+m.optimize()
+
+# Print results for mapping
+print("The number of cut edges is",m.objval)
+
+districts = [ [i for i in K.nodes if x[i,j].x > 0.5] for j in range(k)]
+district_counties = [ [ K.nodes[i]["NAME20"] for i in districts[j] ] for j in range(k)]
+district_populations = [ sum(K.nodes[i]["TOTPOP"] for i in districts[j]) for j in range(k) ]
+
+for j in range(k):
+    print("District",j,"has population",district_populations[j],"and contains counties",district_counties[j])
+    print("")
+
+
