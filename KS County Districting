@@ -1,0 +1,436 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "id": "507a28e2-e364-4056-9c05-5996a32c9cdf",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import json\n",
+    "from networkx.readwrite import json_graph\n",
+    "\n",
+    "def read_graph_from_json(json_file):\n",
+    "    with open(json_file) as f:\n",
+    "        data = json.load(f)\n",
+    "    return json_graph.adjacency_graph(data) "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "id": "f118d91c-284b-47b7-a073-51d67a65976c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# Read Oklahoma county graph from the json file \"OK_county.json\"\n",
+    "path = \"C:/Users/kailu/OneDrive/Documents/1 OR Project/\"\n",
+    "name = 'KS_county.json'\n",
+    "\n",
+    "K = read_graph_from_json( path + name )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "id": "fcead045-891e-495e-95d9-4d2b6bd82128",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "for node in K.nodes:\n",
+    "    K.nodes[node]['POP'] = K.nodes[node]['P0010001']"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "id": "5c6e7e8e-5313-4b43-b2f7-5bea7c98bc6d",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Using L = 730798 and U = 738142 and k = 4\n"
+     ]
+    }
+   ],
+   "source": [
+    "import math\n",
+    "dev = 0.01\n",
+    "k = 4 \n",
+    "total_pop = sum( K.nodes[node]['POP'] for node in K.nodes )\n",
+    "\n",
+    "L = math.ceil( ( 1 - dev / 2 ) * total_pop / k )\n",
+    "U = math.floor( ( 1 + dev / 2 ) * total_pop / k )\n",
+    "print(\"Using L =\",L,\"and U =\",U,\"and k =\",k)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "id": "b1b132ad-e8dd-4377-aa13-fadd83806270",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#!pip install gurobipy\n",
+    "\n",
+    "import gurobipy as gp\n",
+    "from gurobipy import GRB\n",
+    "\n",
+    "# create model \n",
+    "m = gp.Model()\n",
+    "\n",
+    "# create variables\n",
+    "x = m.addVars(K.nodes, k, vtype=GRB.BINARY) # x[i,j] equals one when county i is assigned to district j\n",
+    "y = m.addVars(K.edges, vtype=GRB.BINARY)    # y[u,v] equals one when edge {u,v} is cut"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "id": "2dd520d8-25bc-479f-8455-ff2ca4d84d5a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# objective is to minimize weighted cut edges (district perimeter lengths)\n",
+    "m.setObjective( gp.quicksum( K.edges[u,v]['shared_perim'] * y[u,v] for u,v in K.edges ), GRB.MINIMIZE )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "id": "b43180be-d174-4311-b924-726d663742bd",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# add constraints saying that each county i is assigned to one district\n",
+    "m.addConstrs( gp.quicksum( x[i,j] for j in range(k)) == 1 for i in K.nodes )\n",
+    "\n",
+    "# add constraints saying that each district has population at least L and at most U\n",
+    "m.addConstrs( gp.quicksum( K.nodes[i]['POP'] * x[i,j] for i in K.nodes) >= L for j in range(k) )\n",
+    "m.addConstrs( gp.quicksum( K.nodes[i]['POP'] * x[i,j] for i in K.nodes) <= U for j in range(k) )\n",
+    "\n",
+    "# add constraints saying that edge {u,v} is cut if u is assigned to district j but v is not.\n",
+    "m.addConstrs( x[u,j] - x[v,j] <= y[u,v] for u,v in K.edges for j in range(k) )\n",
+    "\n",
+    "m.update()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "id": "9c8dec28-77bd-4faf-bfc1-6c73926b4975",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Now, let's add contiguity constraints and re-solve the model.\n",
+    "# We will use the contiguity constraints of Hojny et al. (MPC, 2021)\n",
+    "#   https://link.springer.com/article/10.1007/s12532-020-00186-3\n",
+    "\n",
+    "# Add root variables: r[i,j] equals 1 if node i is the \"root\" of district j\n",
+    "r = m.addVars( K.nodes, k, vtype=GRB.BINARY)\n",
+    "\n",
+    "# To solve the MIP faster, fix some district roots:\n",
+    "\n",
+    "#r[6,0].LB = 1  # fix Oklahoma county as root of district 0\n",
+    "#r[34,1].LB = 1 # fix Tulsa county as root of district 1\n",
+    "#r[8,2].LB = 1  # fix Comanche county as root of district 2\n",
+    "\n",
+    "# Add flow variables: f[u,v] = amount of flow sent across arc uv \n",
+    "#  Flows are sent across arcs of the directed version of G which we call DG\n",
+    "\n",
+    "import networkx as nx\n",
+    "DK = nx.DiGraph(K)      # directed version of G\n",
+    "\n",
+    "f = m.addVars( DK.edges )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "id": "0e2f92fd-17bf-45e1-9a9e-58a15fa2ad7b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# The big-M proposed by Hojny et al.\n",
+    "M = K.number_of_nodes() - k + 1\n",
+    "\n",
+    "# Each district j should have one root\n",
+    "m.addConstrs( gp.quicksum( r[i,j] for i in K.nodes ) == 1 for j in range(k) )\n",
+    "\n",
+    "# If node i is not assigned to district j, then it cannot be its root\n",
+    "m.addConstrs( r[i,j] <= x[i,j] for i in K.nodes for j in range(k) ) \n",
+    "\n",
+    "# if not a root, consume some flow.\n",
+    "# if a root, only send out (so much) flow.\n",
+    "m.addConstrs( gp.quicksum( f[j,i] - f[i,j] for j in K.neighbors(i) ) \n",
+    "             >= 1 - M * gp.quicksum( r[i,j] for j in range(k) ) for i in K.nodes )\n",
+    "\n",
+    "# do not send flow across cut edges\n",
+    "m.addConstrs( f[i,j] + f[j,i] <= M * ( 1 - y[i,j] ) for i,j in K.edges )\n",
+    "\n",
+    "m.update()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "81f0d55e-ab50-49c1-acc5-6149469f6f35",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Gurobi Optimizer version 13.0.1 build v13.0.1rc0 (win64 - Windows 11+.0 (26200.2))\n",
+      "\n",
+      "CPU model: AMD Ryzen 7 7735HS with Radeon Graphics, instruction set [SSE2|AVX|AVX2]\n",
+      "Thread count: 8 physical cores, 16 logical processors, using up to 16 threads\n",
+      "\n",
+      "Optimize a model with 1957 rows, 1629 columns and 7937 nonzeros (Min)\n",
+      "Model fingerprint: 0x10d8d8b3\n",
+      "Model has 263 linear objective coefficients\n",
+      "Variable types: 526 continuous, 1103 integer (1103 binary)\n",
+      "Coefficient statistics:\n",
+      "  Matrix range     [1e+00, 6e+05]\n",
+      "  Objective range  [4e-03, 1e+00]\n",
+      "  Bounds range     [1e+00, 1e+00]\n",
+      "  RHS range        [1e+00, 7e+05]\n",
+      "\n",
+      "Presolve removed 5 rows and 3 columns\n",
+      "Presolve time: 0.04s\n",
+      "Presolved: 1952 rows, 1626 columns, 7918 nonzeros\n",
+      "Variable types: 524 continuous, 1102 integer (1102 binary)\n",
+      "\n",
+      "Root relaxation: objective 3.522155e-01, 801 iterations, 0.09 seconds (0.03 work units)\n",
+      "\n",
+      "    Nodes    |    Current Node    |     Objective Bounds      |     Work\n",
+      " Expl Unexpl |  Obj  Depth IntInf | Incumbent    BestBd   Gap | It/Node Time\n",
+      "\n",
+      "     0     0    0.35222    0  438          -    0.35222      -     -    0s\n",
+      "     0     0    0.48798    0  446          -    0.48798      -     -    0s\n",
+      "     0     0    1.36451    0  426          -    1.36451      -     -    1s\n",
+      "     0     0    1.40935    0  449          -    1.40935      -     -    1s\n",
+      "     0     0    1.41693    0  450          -    1.41693      -     -    1s\n",
+      "     0     0    1.59339    0  440          -    1.59339      -     -    2s\n",
+      "     0     0    1.59491    0  440          -    1.59491      -     -    2s\n",
+      "     0     0    1.63313    0  440          -    1.63313      -     -    2s\n",
+      "     0     0    1.63320    0  440          -    1.63320      -     -    2s\n",
+      "     0     0    1.63321    0  440          -    1.63321      -     -    2s\n",
+      "     0     0    1.64232    0  440          -    1.64232      -     -    2s\n",
+      "     0     0    1.64232    0  440          -    1.64232      -     -    2s\n",
+      "     0     0    1.64232    0  442          -    1.64232      -     -    2s\n",
+      "     0     0    1.64232    0  442          -    1.64232      -     -    2s\n",
+      "     0     0    1.64232    0  443          -    1.64232      -     -    3s\n",
+      "     0     0    1.64232    0  443          -    1.64232      -     -    3s\n",
+      "     0     0    1.64232    0  442          -    1.64232      -     -    3s\n",
+      "     0     0    1.64232    0  442          -    1.64232      -     -    3s\n",
+      "     0     0    1.64232    0  440          -    1.64232      -     -    3s\n",
+      "     0     2    1.64364    0  440          -    1.64364      -     -    3s\n",
+      "    73    79    5.78164    7  380          -    2.65508      -   278    5s\n",
+      "   297   308   11.31074   22  349          -    2.65508      -   203   10s\n",
+      "  1031  1037   18.58552  112  118          -    3.50093      -   132   15s\n",
+      "  1613  1460    7.47400   15  441          -    3.62083      -   123   20s\n",
+      "  1727  1561    7.69507   19  334          -    5.27409      -   138   25s\n",
+      "  2092  1779   10.52057   31   82          -    5.27409      -   146   30s\n",
+      "  2320  1920   11.11036   35  236          -    5.31720      -   145   35s\n",
+      "  2763  2190   16.05286   59  136          -    5.31720      -   147   40s\n",
+      "  3720  2737   11.86039   26   55          -    5.31720      -   141   45s\n",
+      "  4976  3381   17.40665   85   62          -    6.19804      -   133   50s\n",
+      "  6079  3776   11.77425   44   39          -    6.29083      -   127   55s\n",
+      "  6587  4265   14.64854   57  186          -    6.53112      -   127   60s\n",
+      "  7804  5375    8.94567   19  252          -    6.68389      -   126   65s\n",
+      "  8733  6053   12.85584   47   71          -    6.68389      -   124   70s\n",
+      " 10075  7321 infeasible  129               -    6.68389      -   121   76s\n",
+      " 11257  7890   13.29940   40   92          -    6.68389      -   118   80s\n",
+      " 11994  8714 infeasible   61               -    7.01497      -   118   85s\n",
+      " 13492  9910   14.91775   56  154          -    7.06769      -   119   91s\n",
+      " 14540 11120    9.61604   31  304          -    7.10069      -   119   97s\n",
+      " 15342 11136   10.64081   67  154          -    7.21579      -   118  100s\n",
+      "H15354  2359                      10.9487541    7.21579  34.1%   118  100s\n",
+      " 16607  3026   10.34636   37   49   10.94875    7.46699  31.8%   117  106s\n",
+      " 17782  3498   10.68214   37  362   10.94875    7.55506  31.0%   117  111s\n",
+      " 19173  4138   10.05112   22  230   10.94875    7.66893  30.0%   117  117s\n",
+      " 20863  4813    8.49356   31  303   10.94875    7.76901  29.0%   116  122s\n",
+      " 21759  5177   10.44540   37  234   10.94875    7.83099  28.5%   116  126s\n",
+      " 23473  5930   10.01089   29  101   10.94875    7.92357  27.6%   116  131s\n",
+      " 24431  6328   10.48842   28  131   10.94875    7.98693  27.1%   115  135s\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "# solve IP model\n",
+    "m.optimize()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "b76b89c0-fe76-44c8-9919-c5acd0a26cc7",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "The number of cut edges is 10.948754075580142\n",
+      "District 0 has population 736211 and contains counties ['Montgomery', 'Labette', 'Sedgwick', 'Butler', 'Sumner', 'Cowley', 'Wilson', 'Elk', 'Chautauqua', 'Greenwood', 'Neosho']\n",
+      "\n",
+      "District 1 has population 734175 and contains counties ['Johnson', 'Miami', 'Linn', 'Crawford', 'Bourbon', 'Anderson', 'Cherokee']\n",
+      "\n",
+      "District 2 has population 735455 and contains counties ['Finney', 'Kearny', 'Ford', 'Chase', 'Barton', 'Ellis', 'Reno', 'Seward', 'Riley', 'Pottawatomie', 'Geary', 'McPherson', 'Ottawa', 'Saline', 'Wabaunsee', 'Harvey', 'Clay', 'Lincoln', 'Smith', 'Morris', 'Barber', 'Logan', 'Rawlins', 'Thomas', 'Rice', 'Ness', 'Osborne', 'Clark', 'Haskell', 'Kingman', 'Stafford', 'Dickinson', 'Edwards', 'Sheridan', 'Kiowa', 'Harper', 'Washington', 'Norton', 'Ellsworth', 'Hodgeman', 'Meade', 'Wichita', 'Grant', 'Rooks', 'Gray', 'Republic', 'Decatur', 'Phillips', 'Hamilton', 'Wallace', 'Pratt', 'Lane', 'Trego', 'Greeley', 'Marion', 'Rush', 'Stanton', 'Sherman', 'Cheyenne', 'Cloud', 'Russell', 'Jewell', 'Mitchell', 'Scott', 'Stevens', 'Comanche', 'Pawnee', 'Graham', 'Morton', 'Gove']\n",
+      "\n",
+      "District 3 has population 732039 and contains counties ['Lyon', 'Atchison', 'Leavenworth', 'Wyandotte', 'Douglas', 'Franklin', 'Doniphan', 'Jefferson', 'Jackson', 'Osage', 'Shawnee', 'Brown', 'Woodson', 'Nemaha', 'Coffey', 'Marshall', 'Allen']\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "print(\"The number of cut edges is\",m.objval)\n",
+    "\n",
+    "# retrieve the districts and their populations\n",
+    "districts = [ [i for i in K.nodes if x[i,j].x > 0.5] for j in range(k)]\n",
+    "district_counties = [ [ K.nodes[i][\"NAME20\"] for i in districts[j] ] for j in range(k)]\n",
+    "district_populations = [ sum(K.nodes[i][\"TOTPOP\"] for i in districts[j]) for j in range(k) ]\n",
+    "\n",
+    "# print district info\n",
+    "for j in range(k):\n",
+    "    print(\"District\",j,\"has population\",district_populations[j],\"and contains counties\",district_counties[j])\n",
+    "    print(\"\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "id": "7126ddbc-a213-4780-80d2-5fa6b29279bf",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#!pip install geopandas\n",
+    "# Let's draw it on a map\n",
+    "import geopandas as gpd"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "05fcdaca-6771-443b-98cd-2adcdb147cca",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# Read Oklahoma county shapefile from \"OK_county.shp\"\n",
+    "filepath = \"C:/Users/kailu/OneDrive/Documents/1 OR Project/Other State Data/\"\n",
+    "filename = 'OK_county.shp'\n",
+    "\n",
+    "\n",
+    "# Read geopandas dataframe from file\n",
+    "df = gpd.read_file( filepath + filename )"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "id": "7584473b-63e9-4701-823c-5076fc42d8da",
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "KeyError",
+     "evalue": "'40149'",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[31m---------------------------------------------------------------------------\u001b[39m",
+      "\u001b[31mKeyError\u001b[39m                                  Traceback (most recent call last)",
+      "\u001b[36mCell\u001b[39m\u001b[36m \u001b[39m\u001b[32mIn[18]\u001b[39m\u001b[32m, line 15\u001b[39m\n\u001b[32m     12\u001b[39m geoid = df[\u001b[33m'\u001b[39m\u001b[33mGEOID20\u001b[39m\u001b[33m'\u001b[39m][u]\n\u001b[32m     14\u001b[39m \u001b[38;5;66;03m# what node in G has this geoid?\u001b[39;00m\n\u001b[32m---> \u001b[39m\u001b[32m15\u001b[39m i = \u001b[43mnode_with_this_geoid\u001b[49m\u001b[43m[\u001b[49m\u001b[43mgeoid\u001b[49m\u001b[43m]\u001b[49m\n\u001b[32m     17\u001b[39m \u001b[38;5;66;03m# position u in the dataframe should be given\u001b[39;00m\n\u001b[32m     18\u001b[39m \u001b[38;5;66;03m# the same district # that county i has in 'labeling'\u001b[39;00m\n\u001b[32m     19\u001b[39m assignment[u] = labeling[i]\n",
+      "\u001b[31mKeyError\u001b[39m: '40149'"
+     ]
+    }
+   ],
+   "source": [
+    "# Which district is each county assigned to?\n",
+    "assignment = [ -1 for i in K.nodes ]\n",
+    "\n",
+    "labeling = { i : j for i in K.nodes for j in range(k) if x[i,j].x > 0.5 }\n",
+    "\n",
+    "# Now add the assignments to a column of the dataframe and map it\n",
+    "node_with_this_geoid = { K.nodes[i]['GEOID20'] : i for i in K.nodes }\n",
+    "\n",
+    "# pick a position u in the dataframe\n",
+    "for u in range(K.number_of_nodes()):\n",
+    "    \n",
+    "    geoid = df['GEOID20'][u]\n",
+    "    \n",
+    "    # what node in G has this geoid?\n",
+    "    i = node_with_this_geoid[geoid]\n",
+    "    \n",
+    "    # position u in the dataframe should be given\n",
+    "    # the same district # that county i has in 'labeling'\n",
+    "    assignment[u] = labeling[i]\n",
+    "    \n",
+    "# now add the assignments to a column of our dataframe and then map it\n",
+    "df['assignment'] = assignment\n",
+    "\n",
+    "my_fig = df.plot(column='assignment').get_figure()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4d6051e1-578e-44a7-a2f4-c195ed83a1a3",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "a75b838a-84d6-4ed1-98d9-d33b78787ce7",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "1765d330-0372-4462-b7fd-0af106bc06c2",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d3fd3e72-0d5b-4169-9d88-344a18469a7c",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.9"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
